@@ -30,7 +30,7 @@ def main():
         print(f"{phase}: {kind} {data.get('case', '')}", flush=True)
     try:
         if phase == "compare":
-            recalled = memory.recall("receiving inspection donor coverage shortage operational judgment")
+            recalled = memory.recall("Cedar stock replenishment firm customer order recovery tradeoffs")
             if {l["source_case"] for l in recalled} != {"T1", "T2"}:
                 raise RuntimeError("Restart recall did not return both teaching incidents")
         (teach if phase == "teach" else compare)(model, memory, uuid.uuid4().hex, emit)

@@ -19,50 +19,68 @@ def case(id, title, day, quantity, need_hour, options, *, topic, cutoff=15):
                 receiving=dict(opens=8, closes=cutoff), options=options, topic=topic)
 
 
+DEMO_VERSION = "judgment-v2"
+
+# Synthetic organizational preferences. Only evaluator and post-decision feedback use these.
+# Never pass this mapping to decide(), snapshot(), or retrieval query construction.
+ORG_RULES = {
+    "replenishment": dict(
+        applies_to="replenishment",
+        applicability="Cedar stock-replenishment orders only.",
+        guidance="Accept up to 2 hours of receiving-plant downtime with zero donor downtime. "
+                 "Among options within these limits, choose the lowest recovery spend, then "
+                 "the least downtime. Eliminating an acceptable delay does not justify a premium.",
+        exceptions="Do not apply this tolerance to firm customer orders. If no option meets "
+                   "these limits, minimize combined downtime, then spend.",
+    ),
+    "firm": dict(
+        applies_to="firm",
+        applicability="Cedar firm customer orders only.",
+        guidance="Allow zero receiving and donor downtime. Among options meeting those limits, "
+                 "choose the lowest recovery spend. A small delay is not acceptable for these orders.",
+        exceptions="Do not extend this zero-delay preference to stock replenishment. If no option "
+                   "meets these limits, minimize combined downtime, then spend.",
+    ),
+}
+
+
+def shortage(id, title, day, quantity, order_class, wait_hour, *, wait_inspection=0,
+             transfer_hour=12, donor_stock=500, donor_rate=10, donor_replenishment_hour=20):
+    c = case(id, title, day, quantity, 14, [
+        option("wait", "wait", f"{day}T{wait_hour}:00", 0, inspection=wait_inspection),
+        option("expedite", "expedite", f"{day}T11:00:00", 1400, inspection=1),
+        option("transfer", "transfer", f"{day}T{transfer_hour:02}:00:00", 350,
+               donor_stock=donor_stock, donor_rate=donor_rate,
+               donor_replenishment=f"{day}T{donor_replenishment_hour:02}:00:00"),
+        option("substitute", "substitute", f"{day}T12:00:00", 800, inspection=1),
+    ], topic="shortage recovery organizational judgment", cutoff=17)
+    c["order_class"] = order_class
+    return c
+
+
 CASES = [
-    case("T1", "A faster truck, a missed receiving window", "2026-10-05", 120, 16, [
-        option("wait", "wait", "2026-10-06T09:00:00", 0, inspection=2),
-        option("expedite", "expedite", "2026-10-05T15:30:00", 1800, inspection=2),
-        option("transfer", "transfer", "2026-10-05T13:00:00", 600,
-               donor_stock=400, donor_rate=10, donor_replenishment="2026-10-06T08:00:00"),
-        option("substitute", "substitute", "2026-10-05T14:00:00", 900, inspection=1),
-    ], topic="usable arrival receiving inspection"),
-    case("T2", "A transfer that moves the shortage", "2026-10-12", 180, 14, [
-        option("wait", "wait", "2026-10-13T09:00:00", 0, inspection=1),
-        option("expedite", "expedite", "2026-10-12T15:00:00", 1500, inspection=1),
-        option("transfer", "transfer", "2026-10-12T11:00:00", 250,
-               donor_stock=200, donor_rate=20, donor_replenishment="2026-10-12T18:00:00"),
-        option("substitute", "substitute", "2026-10-12T12:00:00", 700, inspection=1),
-    ], topic="donor production coverage approved substitutes"),
-    case("E1", "Recover the afternoon build", "2026-11-03", 90, 17, [
-        option("wait", "wait", "2026-11-04T10:00:00", 0, inspection=1),
-        option("expedite", "expedite", "2026-11-03T16:00:00", 1200, inspection=1),
-        option("transfer", "transfer", "2026-11-03T12:00:00", 350,
-               donor_stock=360, donor_rate=8, donor_replenishment="2026-11-04T08:00:00"),
-        option("substitute", "substitute", "2026-11-03T13:00:00", 650, inspection=1),
-    ], topic="usable arrival receiving inspection"),
-    case("E2", "Two plants, one constrained component", "2026-11-09", 150, 13, [
-        option("wait", "wait", "2026-11-10T08:00:00", 0, inspection=1),
-        option("expedite", "expedite", "2026-11-09T14:00:00", 1700, inspection=1),
-        option("transfer", "transfer", "2026-11-09T10:00:00", 200,
-               donor_stock=180, donor_rate=15, donor_replenishment="2026-11-09T20:00:00"),
-        option("substitute", "substitute", "2026-11-09T11:00:00", 550, inspection=1),
-    ], topic="donor production coverage approved substitutes"),
-    case("E3", "Premium freight earns its place", "2026-11-16", 200, 14, [
-        option("wait", "wait", "2026-11-17T09:00:00", 0, inspection=1),
-        option("expedite", "expedite", "2026-11-16T11:00:00", 1400, inspection=1),
-        option("transfer", "transfer", "2026-11-16T12:00:00", 300,
-               donor_stock=220, donor_rate=20, donor_replenishment="2026-11-16T19:00:00"),
-        option("substitute", "substitute", "2026-11-16T13:00:00", 800, inspection=3),
-    ], topic="usable arrival receiving inspection donor production coverage approved substitutes"),
+    shortage("T1", "Stock for the next replenishment cycle", "2026-10-05", 120,
+             "replenishment", "15:30", donor_stock=140, donor_rate=20),
+    shortage("T2", "A firm customer commitment", "2026-10-12", 180,
+             "firm", "15:00", donor_stock=200, donor_rate=20),
+    shortage("E1", "A new replenishment shortage", "2026-11-03", 90,
+             "replenishment", "15:00", donor_stock=110, donor_rate=10),
+    shortage("E2", "Choose a recovery path for stock", "2026-11-09", 150,
+             "replenishment", "16:00", wait_inspection=3, transfer_hour=15,
+             donor_stock=500, donor_rate=15),
+    shortage("E3", "Protect a confirmed shipment", "2026-11-16", 200,
+             "firm", "15:00", donor_stock=220, donor_rate=20),
 ]
+# In the firm cases, the approved substitute misses the need time: premium freight is useful.
+for c in (CASES[1], CASES[4]):
+    c["options"][3]["inspection_hours"] = 4
 TEACHING, EVALUATION = CASES[:2], CASES[2:]
 
 
 def snapshot(c):
     """Explicit allowlist: no lesson theme, narrative title, outcome, or feedback."""
     result = {k: deepcopy(c[k]) for k in ("id", "plant", "component", "date",
-              "shortage_quantity", "needed_at", "receiving", "options")}
+              "shortage_quantity", "needed_at", "receiving", "options", "order_class")}
     result["rules"] = (
         "Both plants produce continuously. All times are local. Receiving admits trucks "
         "from opening through closing (inclusive); later arrivals wait until next opening. "
@@ -100,17 +118,29 @@ def score(outcome):
     return outcome["total_downtime_hours"], outcome["recovery_cost"]
 
 
+def org_score(c, outcome):
+    """Private synthetic evaluator: threshold adherence, then the organization's tradeoff."""
+    limit = 2 if c["order_class"] == "replenishment" else 0
+    acceptable = outcome["receiving_downtime_hours"] <= limit and outcome["donor_downtime_hours"] == 0
+    if acceptable:
+        return (0, outcome["recovery_cost"], outcome["total_downtime_hours"])
+    return (1, outcome["total_downtime_hours"], outcome["recovery_cost"])
+
+
+def assess(c, outcome):
+    best = min(org_score(c, evaluate(c, o["id"])) for o in c["options"] if o["approved"])
+    return dict(aligned=org_score(c, outcome) == best,
+                within_tolerance=org_score(c, outcome)[0] == 0,
+                score=list(org_score(c, outcome)),
+                basis="Synthetic Cedar preference, revealed to the agent only through teaching feedback")
+
+
 def feedback(c, decision, outcome):
-    best = min(score(evaluate(c, o["id"])) for o in c["options"] if o["approved"])
-    verdict = "Confirmed" if score(outcome) == best else "Needs improvement"
-    guidance = {
-        "T1": "Compare when material is usable on the line, not the carrier's arrival promise. "
-              "Receiving cutoffs and inspection can erase a freight advantage. Premium freight "
-              "is justified when it actually prevents downtime at the lowest recovery cost.",
-        "T2": "Protect production across both plants. Check donor coverage through replenishment "
-              "before transferring stock. An approved substitute can be worth its premium; "
-              "a transfer remains appropriate when the donor retains adequate coverage.",
-    }
-    return dict(source="Scripted simulated operator feedback", verdict=verdict,
-                text=f"{decision['option_id']} caused {outcome['total_downtime_hours']} hours "
-                     f"of combined downtime at ${outcome['recovery_cost']}. " + guidance[c["id"]])
+    judgment = assess(c, outcome)
+    rule = deepcopy(ORG_RULES[c["order_class"]])
+    return dict(source="Scripted simulated operator feedback", judgment=judgment,
+                verdict="Confirmed" if judgment["aligned"] else "Needs improvement",
+                text=f"{decision['option_id']} caused {outcome['receiving_downtime_hours']} hours "
+                     f"of receiving downtime and {outcome['donor_downtime_hours']} hours at the donor, "
+                     f"at ${outcome['recovery_cost']}. " + rule["guidance"] + " " + rule["exceptions"],
+                confirmed_lesson=rule)

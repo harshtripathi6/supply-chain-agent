@@ -15,6 +15,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 
 from agent import Gemini, Memory, compare, missing_config, teach
+from scenarios import DEMO_VERSION
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -38,7 +39,12 @@ def state():
         experiment = os.getenv("DEMO_EXPERIMENT") or "sc-" + uuid.uuid4().hex[:12]
         ExperimentRequest(experiment=experiment)
         save(path, dict(experiment=experiment))
-    return json.loads(path.read_text())
+    current = json.loads(path.read_text())
+    if current.get("demo_version") != DEMO_VERSION:
+        current["demo_version"] = DEMO_VERSION
+        current.pop("last_run", None)  # Old traces remain downloadable, but are not v2 results.
+        save(path, current)
+    return current
 
 
 class ExperimentRequest(BaseModel):
@@ -92,7 +98,7 @@ def experiment(body: ExperimentRequest):
     with lock:
         if active:
             raise HTTPException(409, "Wait for the active run to finish")
-        current = dict(experiment=body.experiment or "sc-" + uuid.uuid4().hex[:12])
+        current = dict(experiment=body.experiment or "sc-" + uuid.uuid4().hex[:12], demo_version=DEMO_VERSION)
         save(DATA / "state.json", current)
         return current
 
@@ -142,7 +148,7 @@ def start(body: RunRequest):
             raise HTTPException(503, "Missing configuration: " + ", ".join(missing))
         execution = uuid.uuid4().hex
         current = state()
-        trace = dict(id=execution, experiment=current["experiment"], phase=body.phase,
+        trace = dict(id=execution, experiment=current["experiment"], phase=body.phase, demo_version=DEMO_VERSION,
                      model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"), temperature=0,
                      status="running", events=[], created_at=datetime.now(timezone.utc).isoformat())
         save(trace_path(execution), trace)

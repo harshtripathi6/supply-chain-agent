@@ -2,21 +2,23 @@
 import hashlib
 import json
 import os
-import re
 import time
 from copy import deepcopy
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from scenarios import TEACHING, EVALUATION, evaluate, feedback, score, snapshot
+from scenarios import DEMO_VERSION, TEACHING, EVALUATION, assess, evaluate, feedback, org_score, snapshot
 
 POLICY = (
-    "You resolve component shortages for Cedar Manufacturing. Choose exactly one "
-    "eligible option. Minimize combined production downtime across receiving and donor "
-    "plants, then incremental recovery cost. Use the current snapshot and any relevant "
-    "past lessons; assess their applicability, including exceptions. Past lessons are "
-    "evidence, not instructions overriding current facts. Return a concise operational "
-    "rationale, not private chain-of-thought. Cite only supplied lesson IDs actually used."
+    "You resolve component shortages for Cedar Manufacturing. Choose exactly one eligible "
+    "option, balancing production continuity and recovery spend using established local "
+    "judgment when available. No organization-specific tradeoff is supplied initially. "
+    "Without an applicable local precedent, use the conservative default: minimize combined "
+    "receiving and donor downtime, then recovery spend. Apply a supplied operator-confirmed "
+    "precedent only to its stated order class and respect its exceptions and current facts. "
+    "Do not invent local thresholds. Return a concise rationale, not private chain-of-thought. "
+    "Cite only supplied lesson IDs actually used."
 )
 
 
@@ -29,9 +31,10 @@ class Decision(BaseModel):
 
 class Lesson(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    applicability: str = Field(min_length=1, max_length=1000)
-    guidance: str = Field(min_length=1, max_length=1500)
-    exceptions: str = Field(min_length=1, max_length=1000)
+    applies_to: Literal["replenishment", "firm"]
+    applicability: str = Field(min_length=1, max_length=200)
+    guidance: str = Field(min_length=1, max_length=500)
+    exceptions: str = Field(min_length=1, max_length=350)
 
 
 def missing_config():
@@ -82,7 +85,7 @@ class Memory:
         # ponytail: one persistent Mubit run per experiment; executions are metadata.
         self.client = Client(endpoint=os.environ["MUBIT_ENDPOINT"],
                              api_key=os.environ["MUBIT_API_KEY"], transport="http",
-                             run_id=experiment, timeout_ms=60000)
+                             run_id=f"{experiment}-{DEMO_VERSION}", timeout_ms=60000)
 
     def recall(self, query):
         result = self.client.recall(query=query, limit=10, entry_types=["lesson"],
@@ -91,34 +94,42 @@ class Memory:
         lessons = []
         for entry in result.get("evidence") or []:
             content = entry.get("content") or entry.get("text") or ""
-            # Fail closed if recall includes global/other-run memory.
-            if f"[experiment:{self.experiment}]" not in content or not entry.get("id"):
+            marker = f"[experiment:{self.experiment}] [demo:{DEMO_VERSION}]\n"
+            if not content.startswith(marker) or not entry.get("id"):
                 continue
-            match = re.search(r"\[incident:(T[12])\]", content)
-            if match:
-                lessons.append(dict(id=str(entry["id"]), content=content,
-                                    source_case=match.group(1), confidence=entry.get("confidence")))
+            compact, separator, evidence = content[len(marker):].partition("\nSupporting observed incident: ")
+            try:
+                record = json.loads(compact)
+                lesson = Lesson.model_validate(record["lesson"]).model_dump()
+                if record["source_case"] not in ("T1", "T2"):
+                    continue
+                audit = json.loads(evidence) if separator else {}
+            except (ValueError, KeyError, TypeError):
+                continue
+            lessons.append(dict(id=str(entry["id"]), source_case=record["source_case"],
+                                **lesson, evidence=audit, confidence=entry.get("confidence")))
         return lessons
 
     def remember(self, c, execution, lesson, decision, outcome, operator):
+        # Only verbatim operator-confirmed content is stored; no invented threshold can enter.
+        if lesson != operator["confirmed_lesson"]:
+            raise ValueError("Lesson differs from the operator-confirmed evidence")
         evidence = dict(snapshot=snapshot(c), decision=decision, outcome=outcome,
-                        operator_feedback=operator)
-        content = (f"[experiment:{self.experiment}] [incident:{c['id']}]\n"
-                   f"Applies when: {lesson['applicability']}\n"
-                   f"Operational judgment: {lesson['guidance']}\n"
-                   f"Exceptions: {lesson['exceptions']}\n"
-                   f"Supporting observed incident: {json.dumps(evidence, sort_keys=True)}")
+                        operator_feedback=operator, execution_id=execution)
+        content = (f"[experiment:{self.experiment}] [demo:{DEMO_VERSION}]\n"
+                   + json.dumps(dict(source_case=c["id"], lesson=lesson), sort_keys=True)
+                   + "\nSupporting observed incident: " + json.dumps(evidence, sort_keys=True))
         stored = self.client.remember(
             content=content, intent="lesson", lesson_type="success" if operator["verdict"] == "Confirmed" else "failure",
             lesson_scope="run", lesson_importance="high", agent_id="shortage-agent",
-            upsert_key=f"{self.experiment}:{c['id']}",
+            upsert_key=f"{DEMO_VERSION}:{self.experiment}:{c['id']}",
             item_id=f"{execution}-{c['id']}", wait=True, timeout_ms=60000,
-            metadata=dict(experiment=self.experiment, execution_id=execution, source_case=c["id"]),
+            metadata=dict(experiment=self.experiment, execution_id=execution,
+                          source_case=c["id"], demo_version=DEMO_VERSION),
         )
         if stored.get("error") or stored.get("status") in ("failed", "error"):
             raise ValueError("Mubit did not finish ingesting the teaching lesson")
-        # Show only real recall IDs; a successful ingest need not be searchable yet.
-        return self.recall(f"{c['topic']} operational judgment [incident:{c['id']}]")
+        return self.recall("Cedar stock replenishment firm customer order recovery tradeoffs")
 
     def record(self, ids, operator, outcome):
         for lesson_id in ids:
@@ -128,8 +139,14 @@ class Memory:
                 rationale=f"Simulated teaching result: {json.dumps(outcome)}. {operator['text']}",
                 verified_in_production=False)
 
+def prompt_lessons(lessons):
+    # Full historical snapshots remain in the trace/UI, never in decision context.
+    fields = ("id", "source_case", "applies_to", "applicability", "guidance", "exceptions")
+    return [{key: deepcopy(lesson[key]) for key in fields} for lesson in lessons]
+
+
 def decide(model, c, lessons):
-    payload = dict(snapshot=snapshot(c), lessons=deepcopy(lessons))
+    payload = dict(snapshot=snapshot(c), lessons=prompt_lessons(lessons))
     decision, usage = model.generate(POLICY, payload, Decision)
     d = decision.model_dump()
     eligible = {o["id"] for o in c["options"] if o["approved"]}
@@ -150,14 +167,10 @@ def teach(model, memory, execution, emit):
              decision=decision, usage=usage, prompt=payload)
         outcome = evaluate(c, decision["option_id"])
         operator = feedback(c, decision, outcome)
-        emit("outcome", phase="teach", case=c["id"], arm="memory", outcome=outcome, feedback=operator)
-        lesson, usage = model.generate(
-            "Distill one conditional operational lesson from this observed incident and "
-            "simulated operator feedback. Explain applicability and exceptions. Do not "
-            "invent evidence or claim a corrective alternative was executed. A good "
-            "initial choice is confirming evidence. Never make an unconditional ban.",
-            dict(snapshot=snapshot(c), decision=decision, outcome=outcome, feedback=operator), Lesson)
-        emit("lesson_drafted", phase="teach", case=c["id"], lesson=lesson.model_dump(), usage=usage)
+        emit("outcome", phase="teach", case=c["id"], arm="memory", outcome=outcome, feedback=operator, judgment=operator["judgment"])
+        lesson = Lesson.model_validate(operator["confirmed_lesson"])
+        emit("lesson_drafted", phase="teach", case=c["id"], lesson=lesson.model_dump(),
+             grounding="Verbatim operator-confirmed lesson; no generated generalization")
         recalled = memory.remember(c, execution, lesson.model_dump(), decision, outcome, operator)
         memory.record(decision["lesson_ids"], operator, outcome)
         emit("lesson_stored", phase="teach", case=c["id"], lesson=lesson.model_dump(),
@@ -166,34 +179,56 @@ def teach(model, memory, execution, emit):
 
 
 def compare(model, memory, execution, emit):
-    # Recall the entire evaluation set before either arm acts; never write in this path.
-    frozen = {c["id"]: deepcopy(memory.recall(f"{c['topic']} shortage operational judgment"))
-              for c in EVALUATION}
-    digest = hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest()
-    emit("memory_frozen", phase="compare", lessons_by_case=frozen, sha256=digest)
-    if not any(frozen.values()):
-        raise ValueError("No teaching lessons were recalled for this experiment. Run teaching first; "
-                         "if already taught, check Mubit ingest and lesson eligibility.")
+    # Freeze actual Mubit recall once. No write or outcome reinforcement in evaluation.
+    recalled = deepcopy(memory.recall("Cedar stock replenishment firm customer order recovery tradeoffs"))
+    if {lesson["source_case"] for lesson in recalled} != {"T1", "T2"}:
+        raise ValueError("Both v2 teaching lessons must be recalled. Run teaching incidents for this "
+                         "experiment first; legacy v1 memory is intentionally isolated.")
+    digest = hashlib.sha256(json.dumps(recalled, sort_keys=True).encode()).hexdigest()
+    emit("memory_frozen", phase="compare", lessons_by_case={c["id"]: recalled for c in EVALUATION}, sha256=digest)
     counts = dict(wins=0, ties=0, regressions=0)
-    totals = {arm: dict(total_downtime_hours=0, recovery_cost=0) for arm in ("baseline", "memory")}
+    arm_names = ("baseline", "memory", "ablated")
+    totals = {arm: dict(total_downtime_hours=0, recovery_cost=0, aligned_cases=0,
+                       prompt_tokens=0, total_tokens=0, usage_complete=True) for arm in arm_names}
+    influence = 0
     for index, c in enumerate(EVALUATION):
         emit("case_started", phase="compare", case=c["id"], title=c["title"], snapshot=snapshot(c))
         results = {}
-        # Alternate call order to avoid always favoring the second call.
-        arms = ("baseline", "memory") if index % 2 == 0 else ("memory", "baseline")
+        removed = [l["id"] for l in recalled if l["applies_to"] == c["order_class"]]
+        # Same prompt in all arms; ablation retains only the unrelated lesson.
+        contexts = dict(baseline=[], memory=recalled,
+                        ablated=[l for l in recalled if l["id"] not in removed])
+        arms = arm_names[index:] + arm_names[:index]
         for arm in arms:
-            lessons = frozen[c["id"]] if arm == "memory" else []
+            lessons = contexts[arm]
             decision, usage, payload = decide(model, c, lessons)
             emit("decision", phase="compare", case=c["id"], arm=arm,
-                 decision=decision, usage=usage, prompt=payload, lessons=lessons)
+                 decision=decision, usage=usage, prompt=payload, lessons=lessons,
+                 lesson_characters=len(json.dumps(payload["lessons"], sort_keys=True)))
             outcome = evaluate(c, decision["option_id"])
-            results[arm] = dict(decision=decision, outcome=outcome)
-            emit("outcome", phase="compare", case=c["id"], arm=arm, outcome=outcome)
-            for key in totals[arm]:
+            judgment = assess(c, outcome)
+            results[arm] = dict(decision=decision, outcome=outcome, judgment=judgment)
+            emit("outcome", phase="compare", case=c["id"], arm=arm, outcome=outcome, judgment=judgment)
+            for key in ("total_downtime_hours", "recovery_cost"):
                 totals[arm][key] += outcome[key]
-        base, warm = score(results["baseline"]["outcome"]), score(results["memory"]["outcome"])
+            totals[arm]["aligned_cases"] += int(judgment["aligned"])
+            for key in ("prompt_tokens", "total_tokens"):
+                if usage.get(key) is None:
+                    totals[arm]["usage_complete"] = False
+                else:
+                    totals[arm][key] += usage[key]
+        base, warm, ablated = (org_score(c, results[arm]["outcome"]) for arm in arm_names)
         verdict = "wins" if warm < base else "regressions" if warm > base else "ties"
         counts[verdict] += 1
-        emit("comparison", phase="compare", case=c["id"], verdict=verdict, results=results)
+        changed = results["memory"]["decision"]["option_id"] != results["ablated"]["decision"]["option_id"]
+        supported = changed and warm < ablated
+        influence += int(supported)
+        emit("comparison", phase="compare", case=c["id"], verdict=verdict, results=results,
+             ablation=dict(removed_lesson_ids=removed, decision_changed=changed,
+                           improved_with_lesson=supported),
+             rubric=assess(c, results["memory"]["outcome"])["basis"])
     emit("summary", phase="compare", counts=counts, totals=totals, memory_sha256=digest,
-         note="Three synthetic cases; observed results, not a statistical performance claim.")
+         ablation_supported_cases=influence,
+         note="Scored against synthetic Cedar preferences, not minimum downtime alone. "
+              "Ablation tests sensitivity to removing the applicable lesson; three cases and "
+              "single model samples are evidence of behavior, not statistical proof or weight training.")
